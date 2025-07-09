@@ -1,0 +1,298 @@
+import { getCollection } from '../config/firebase';
+import { Analytics } from '../types/database';
+import { getFirestoreDB } from '../config/firebase';
+import { DocumentSnapshot } from 'firebase-admin/firestore';
+import OpenAI from 'openai';
+import PDFDocument from 'pdfkit';
+import path from 'path';
+
+export interface AnalyticsQuery {
+  id?: string | undefined;
+  project_id?: string | undefined;
+  metric_name?: string | undefined;
+  period?: 'daily' | 'weekly' | 'monthly' | 'current' | undefined;
+  start_date?: Date | undefined;
+  end_date?: Date | undefined;
+}
+
+// PersonalScheduleAnalysis 인터페이스 정의
+export interface PersonalScheduleAnalysis {
+  date: string;
+  total_schedules: number;
+  completed_schedules: number;
+  start_time_distribution: Record<string, number>;
+  end_time_distribution: Record<string, number>;
+  completion_rate_by_tag: Record<string, { completion_rate: number; avg_duration: number }>;
+  duration_distribution: Record<string, number>;
+  task_count_by_emotion: Record<string, number>;
+  task_count_by_status: Record<string, number>;
+  schedule_count_by_time_slot: Record<string, number>;
+  cumulative_completions: Record<string, number>;
+}
+
+export const getAnalytics = async (query: AnalyticsQuery = {}): Promise<Analytics[]> => {
+  try {
+    let collectionRef: any = getCollection('personal_tasks');
+    if (query.id) {
+      collectionRef = collectionRef.where('id', '==', query.id);
+    }
+    // if (query.metric_name) {
+    //   collectionRef = collectionRef.where('metric_name', '==', query.metric_name);
+    // }
+    // if (query.period) {
+    //   collectionRef = collectionRef.where('period', '==', query.period);
+    // }
+    // if (query.start_date) {
+    //   collectionRef = collectionRef.where('date', '>=', query.start_date);
+    // }
+    // if (query.end_date) {
+    //   collectionRef = collectionRef.where('date', '<=', query.end_date);
+    // }
+    const snapshot = await collectionRef.get();
+    const analytics: Analytics[] = [];
+    snapshot.forEach((doc: any) => {
+      analytics.push({
+        id: doc.id,
+        ...doc.data()
+      } as Analytics);
+    });
+    return analytics;
+  } catch (error) {
+    console.error('Analytics 데이터 조회 실패:', error);
+    throw error;
+  }
+};
+
+// 최근 3개월간 개인 일정 분석 데이터 조회 함수
+export async function getRecentPersonalSchedule(): Promise<PersonalScheduleAnalysis[]> {
+  try {
+    const db = getFirestoreDB();
+    const threeMonthsAgo = new Date();
+    threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+    
+    const snapshot = await db.collection('PersonalScheduleAnalysis')
+      .where('date', '>=', threeMonthsAgo.toISOString().split('T')[0])
+      .orderBy('date', 'desc')
+      .get();
+    
+    return snapshot.docs.map((doc: DocumentSnapshot) => ({
+      id: doc.id,
+      ...doc.data()
+    })) as unknown as PersonalScheduleAnalysis[];
+  } catch (error) {
+    console.error('Error fetching recent personal schedule analysis:', error);
+    throw error;
+  }
+}
+
+// LLM 요약/조언 (OpenAI 예시)
+export async function getKoreanAnalysis(summaryData: PersonalScheduleAnalysis[]): Promise<{ summary: string, advice: string }> {
+
+  // OpenAI 객체 생성 (v4)
+  const openai = new OpenAI({
+    apiKey: process.env['OPENAI_API_KEY']!, // `.env.local`에서 가져와야 함
+  });
+
+  const stats = makeStatsForPrompt(summaryData);
+  const prompt = `
+아래는 최근 3개월간 사용자의 일정 데이터 통계입니다.
+${JSON.stringify(stats, null, 2)}
+1. 일정 관리 경향을 한글로 요약해줘.
+2. 더 잘 실천하거나 개선할 수 있는 팁/조언을 2~3가지 제시해줘.
+(모두 자연스러운 한국어로!)`;
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o',
+    messages: [{ role: 'system', content: '너는 일정 데이터를 분석하는 전문 어시스턴트야.' },
+               { role: 'user', content: prompt }]
+  });
+  const text = response.choices[0]?.message?.content ?? '';
+  const parts = text.split(/\n[2-3]\./);
+  const summary = parts[0] || '분석 데이터가 부족합니다.';
+  const advice = parts[1] || '더 많은 데이터를 수집한 후 다시 분석해주세요.';
+  return { summary, advice };
+}
+
+// 통계 데이터 생성 함수
+export function makeStatsForPrompt(scheduleData: PersonalScheduleAnalysis[]) {
+  const totalSchedules = scheduleData.reduce((sum, item) => sum + item.total_schedules, 0);
+  const completedSchedules = scheduleData.reduce((sum, item) => sum + item.completed_schedules, 0);
+  
+  return {
+    totalSchedules,
+    completedSchedules,
+    completionRate: totalSchedules > 0 ? (completedSchedules / totalSchedules) * 100 : 0,
+    averageDailySchedules: scheduleData.length > 0 ? totalSchedules / scheduleData.length : 0
+  };
+}
+
+// 기간 라벨 생성 함수
+export function getPeriodLabel(months: number): string {
+  const endDate = new Date();
+  const startDate = new Date();
+  startDate.setMonth(startDate.getMonth() - months);
+  
+  return `${startDate.toISOString().split('T')[0]} ~ ${endDate.toISOString().split('T')[0]}`;
+}
+
+// 한국어 PDF 문서 정의 생성 함수 (임시 구현)
+export function makeKoreanReportDoc(summary: string, advice: string, statsTable: any, periodLabel: string) {
+  return {
+    content: [
+      { text: '개인 일정 분석 레포트', style: 'header' },
+      { text: periodLabel, style: 'subheader' },
+      { text: summary, style: 'body' },
+      { text: '조언:', style: 'subheader' },
+      { text: advice, style: 'body' },
+      { text: '통계 요약:', style: 'subheader' },
+      { text: `총 일정: ${statsTable.totalSchedules}개`, style: 'body' },
+      { text: `완료 일정: ${statsTable.completedSchedules}개`, style: 'body' },
+      { text: `완료율: ${statsTable.completionRate.toFixed(1)}%`, style: 'body' }
+    ],
+    styles: {
+      header: { fontSize: 18, bold: true, margin: [0, 0, 0, 10] },
+      subheader: { fontSize: 14, bold: true, margin: [0, 10, 0, 5] },
+      body: { fontSize: 12, margin: [0, 5, 0, 5] }
+    }
+  };
+}
+
+// 보고서 기록 저장 함수
+export async function saveReportRecord(userId: string, summary: string, statsTable: any, scheduleData: PersonalScheduleAnalysis[], periodLabel: string) {
+  try {
+    const db = getFirestoreDB();
+    await db.collection('ComprehensiveAnalysisReport').add({
+      userId,
+      summary,
+      statsTable,
+      scheduleData,
+      periodLabel,
+      createdAt: new Date(),
+      reportType: 'personal'
+    });
+  } catch (error) {
+    console.error('Error saving report record:', error);
+    // 보고서 저장 실패는 전체 프로세스를 중단하지 않음
+  }
+}
+
+// PDF 생성 함수 (차트 이미지+설명 지원)
+export function generatePDFBuffer(
+  summary: string,
+  advice: string,
+  statsTable: any,
+  scheduleData: any[],
+  periodLabel: string,
+  chartImages?: string[],
+  chartDescriptions?: string[]
+): Promise<Buffer> {
+  return new Promise((resolve) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 50 });
+
+    const chunks: Buffer[] = [];
+    doc.on('data', (chunk: Buffer) => chunks.push(chunk));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+
+     // ★★★★★ 한글 ttf 폰트 등록
+    doc.registerFont('Korean', path.resolve(__dirname, '../../fonts/NotoSansKR-Regular.ttf'));
+    doc.registerFont('Korean-Bold', path.resolve(__dirname, '../../fonts/NotoSansKR-Bold.ttf'));
+
+    // ===== 헤더 (사이트 메인 컬러) =====
+    doc.save();
+    doc.rect(0, 0, doc.page.width, 60).fill('#3b82f6'); // 메인 파랑
+    doc.restore();
+    doc.fillColor('white').fontSize(22).font('Korean-Bold').text('일정 분석 리포트', 50, 20);
+    doc.fillColor('#fbbf24').fontSize(12).font('Korean').text(periodLabel, 400, 30, { align: 'right' });
+    doc.moveDown(2);
+
+    // ===== 요약 표 =====
+    doc.fillColor('black').fontSize(13).font('Korean-Bold').text('요약', { underline: true });
+    doc.moveDown(0.5);
+    doc.font('Korean').fontSize(11);
+    if (statsTable) {
+      doc.text(`총 일정: ${statsTable.totalSchedules ?? '-'}개`, { continued: true })
+        .text(`   참석자: ${statsTable.totalAttendees ?? '-'}명`, { continued: true })
+        .text(`   주최 기관: ${statsTable.totalOrganizers ?? '-'}개`);
+      if ('completedSchedules' in statsTable) {
+        doc.text(`   완료 일정: ${statsTable.completedSchedules ?? '-'}개`, { continued: true });
+      }
+      if ('completionRate' in statsTable) {
+        doc.text(`   완료율: ${statsTable.completionRate?.toFixed(1) ?? '-'}%`, { continued: true });
+      }
+      if ('averageDailySchedules' in statsTable) {
+        doc.text(`   일평균 일정: ${statsTable.averageDailySchedules?.toFixed(1) ?? '-'}개`);
+      }
+    }
+    doc.moveDown(1);
+    // 구분선
+    doc.moveTo(50, doc.y).lineTo(doc.page.width - 50, doc.y).stroke('#e5e7eb');
+    doc.moveDown(1);
+
+    // ===== 요약/조언/상세 =====
+    if (summary) {
+      doc.fontSize(13).font('Korean-Bold').fillColor('#3b82f6').text('분석 요약');
+      doc.moveDown(0.2);
+      doc.font('Korean').fontSize(11).fillColor('black').text(summary);
+      doc.moveDown(0.5);
+    }
+    if (advice) {
+      doc.fontSize(13).font('Korean-Bold').fillColor('#3b82f6').text('개선 조언');
+      doc.moveDown(0.2);
+      doc.font('Korean').fontSize(11).fillColor('black').text(advice);
+      doc.moveDown(0.5);
+    }
+    if (scheduleData && scheduleData.length > 0) {
+      doc.fontSize(13).font('Korean-Bold').fillColor('#3b82f6').text('상세 일정');
+      doc.moveDown(0.2);
+      doc.font('Korean').fontSize(10).fillColor('black');
+      scheduleData.forEach((item, index) => {
+        const completionRate = item.total_schedules > 0 
+          ? ((item.completed_schedules / item.total_schedules) * 100).toFixed(1) 
+          : '0';
+        doc.text(`${item.date}: 총 ${item.total_schedules}, 완료 ${item.completed_schedules} (${completionRate}%)`);
+        if (index < scheduleData.length - 1) doc.moveDown(0.2);
+      });
+      doc.moveDown(0.5);
+    }
+    // 구분선
+    doc.moveTo(50, doc.y).lineTo(doc.page.width - 50, doc.y).stroke('#e5e7eb');
+    doc.moveDown(1);
+
+    // ===== 차트 영역 (작게, 구분선 포함) =====
+    if (Array.isArray(chartImages) && Array.isArray(chartDescriptions)) {
+      chartImages.forEach((img, idx) => {
+        if (!img) return;
+        doc.fontSize(12).font('Korean-Bold').fillColor('#22223b').text(chartDescriptions[idx] || '', { align: 'left' });
+        doc.moveDown(0.2);
+        try {
+          const base64 = img.replace(/^data:image\/png;base64,/, '');
+          const buf = Buffer.from(base64, 'base64');
+          doc.image(buf, { fit: [300, 150], align: 'center', valign: 'center' });
+        } catch (e) {
+          doc.fontSize(10).font('Korean').fillColor('red').text('차트 이미지를 불러올 수 없습니다.');
+        }
+        doc.moveDown(0.5);
+        doc.moveTo(50, doc.y).lineTo(doc.page.width - 50, doc.y).stroke('#e5e7eb');
+        doc.moveDown(0.5);
+      });
+    }
+
+    // 페이지 번호는 모든 페이지가 추가된 후에 붙인다
+    const pageRange = doc.bufferedPageRange();
+    for (let i = pageRange.start; i < pageRange.start + pageRange.count; i++) {
+      doc.switchToPage(i);
+      doc
+        .fontSize(10)
+        .font('Korean')
+        .fillColor('#60a5fa')
+        .text(
+          `Page ${i - pageRange.start + 1} / ${pageRange.count}`,
+          doc.page.margins.left,
+          doc.page.height - doc.page.margins.bottom - 20,
+          { align: 'center' }
+        );
+    }
+
+    doc.end();
+  });
+} 
